@@ -1,0 +1,11 @@
+shapely
+pyyaml
+numpy
+tqdm
+pillow
+astunparse
+jittor
+tensorboardX
+opencv-python
+tqdm
+terminaltables

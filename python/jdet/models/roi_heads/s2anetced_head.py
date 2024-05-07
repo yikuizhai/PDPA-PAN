@@ -1,0 +1,1140 @@
+import operator
+import random
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import jittor as jt
+from jittor import nn
+import os
+import cv2
+from jdet.models.utils.weight_init import normal_init, bias_init_with_prob
+from jdet.models.utils.modules import ConvModule
+from jdet.utils.general import multi_apply
+from jdet.utils.registry import HEADS, LOSSES, BOXES, build_from_cfg
+
+# from jdet.ops.dcn_v2 import DeformConv
+from jdet.ops.dcn_v1 import DeformConv
+from jdet.ops.orn import ORConv2d, RotationInvariantPooling
+from jdet.ops.nms_rotated import multiclass_nms_rotated
+from jdet.models.boxes.box_ops import delta2bbox_rotated, rotated_box_to_poly
+from jdet.models.boxes.anchor_target import images_to_levels, anchor_target
+from jdet.models.boxes.anchor_generator import AnchorGeneratorRotatedS2ANet
+
+
+@HEADS.register_module()
+class S2ANetCEDHead(nn.Module):
+
+    def __init__(self,
+                 num_classes,
+                 in_channels,
+                 feat_channels=256,
+                 stacked_convs=2,
+                 with_orconv=True,
+                 anchor_scales=[4],
+                 anchor_ratios=[1.0],
+                 anchor_strides=[8, 16, 32, 64, 128],
+                 anchor_base_sizes=None,
+                 target_means=(.0, .0, .0, .0, .0),
+                 target_stds=(1.0, 1.0, 1.0, 1.0, 1.0),
+                 loss_fam_cls=dict(
+                     type='FocalLoss',
+                     use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
+                     loss_weight=1.0),
+                 loss_fam_bbox=dict(
+                     type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
+                 loss_odm_cls=dict(
+                     type='FocalLoss',
+                     use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
+                     loss_weight=1.0),
+                 loss_odm_bbox=dict(
+                     type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
+                 test_cfg=dict(
+                     nms_pre=2000,
+                     min_bbox_size=0,
+                     score_thr=0.05,
+                     nms=dict(type='nms_rotated', iou_thr=0.1),
+                     max_per_img=2000),
+                 train_cfg=dict(
+                     fam_cfg=dict(
+                         assigner=dict(
+                             type='MaxIoUAssigner',
+                             pos_iou_thr=0.5,
+                             neg_iou_thr=0.4,
+                             min_pos_iou=0,
+                             # 正样本的iou最小值。如果assign给ground truth的anchors中最大的IOU低于0，
+                             # 则忽略所有的anchors，否则保留最大IOU的anchor
+                             # 至少保留一个正样本
+                             ignore_iof_thr=-1,
+                             # 忽略bbox的阈值，当ground truth中包含需要忽略的bbox时使用，-1表示不忽略
+                             iou_calculator=dict(type='BboxOverlaps2D_rotated')),
+                         bbox_coder=dict(type='DeltaXYWHABBoxCoder',
+                                         target_means=(0., 0., 0., 0., 0.),
+                                         target_stds=(1., 1., 1., 1., 1.),
+                                         clip_border=True),
+                         allowed_border=-1,
+                         pos_weight=-1,
+                         debug=False),
+                     odm_cfg=dict(
+                         assigner=dict(
+                             type='MaxIoUAssigner',
+                             pos_iou_thr=0.5,
+                             neg_iou_thr=0.4,
+                             min_pos_iou=0,
+                             ignore_iof_thr=-1,
+                             iou_calculator=dict(type='BboxOverlaps2D_rotated')),
+                         bbox_coder=dict(type='DeltaXYWHABBoxCoder',
+                                         target_means=(0., 0., 0., 0., 0.),
+                                         target_stds=(1., 1., 1., 1., 1.),
+                                         clip_border=True),
+                         allowed_border=-1,
+                         pos_weight=-1,
+                         debug=False),
+                     loss_odm_ced=dict(
+                         select_mode='all',
+                         random_sampling_num=128,
+                         dic_pos_IOU=0.5,
+                         dic_neg_IOU=0.4,
+                         dic_sampling_num=5,
+                         dic_samping_hard_rate=0.25,
+                         dic_max_len=25,
+                         dic_neg_expansion=2,
+                         loss_pos_IOU=0.5,
+                         loss_pos_num=24,
+                         loss_neg_IOU=0.4,
+                         loss_neg_num=8,
+                         loss_weights=1.,
+                         losses_warm_para=0.1),
+                 ),
+                 ):
+        super(S2ANetCEDHead, self).__init__()
+        self.x = []
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.feat_channels = feat_channels
+        self.stacked_convs = stacked_convs
+        self.with_orconv = with_orconv
+        self.anchor_scales = anchor_scales
+        self.anchor_ratios = anchor_ratios
+        self.anchor_strides = anchor_strides
+        self.anchor_base_sizes = list(
+            anchor_strides) if anchor_base_sizes is None else anchor_base_sizes
+        self.target_means = target_means
+        self.target_stds = target_stds
+
+        self.use_sigmoid_cls = loss_odm_cls.get('use_sigmoid', False)
+        self.sampling = loss_odm_cls['type'] not in ['FocalLoss', 'GHMC']
+        if self.use_sigmoid_cls:
+            self.cls_out_channels = num_classes - 1
+        else:
+            self.cls_out_channels = num_classes
+
+        if self.cls_out_channels <= 0:
+            raise ValueError('num_classes={} is too small'.format(num_classes))
+        self.loss_fam_cls = build_from_cfg(loss_fam_cls, LOSSES)
+        self.loss_fam_bbox = build_from_cfg(loss_fam_bbox, LOSSES)
+        self.loss_odm_cls = build_from_cfg(loss_odm_cls, LOSSES)
+        self.loss_odm_bbox = build_from_cfg(loss_odm_bbox, LOSSES)
+
+        # change this start
+        CED_cfg = train_cfg['loss_odm_ced']
+        self.ced_mode = CED_cfg['select_mode']
+        if self.ced_mode == 'all' or self.ced_mode == 'single':
+            self.CED_dict = {}
+            if self.ced_mode == "all":
+                for i in range(self.num_classes):
+                    if i not in self.CED_dict:
+                        self.CED_dict[str(i)] = []
+
+        self.random_sampling_num = CED_cfg['random_sampling_num']
+        self.dic_pos_thr = CED_cfg['dic_pos_IOU']
+        self.dic_neg_thr = CED_cfg['dic_neg_IOU']
+        self.dic_sampling_num = CED_cfg['dic_sampling_num']
+        self.dic_max_len = CED_cfg['dic_max_len']
+        self.dic_neg_expansion = CED_cfg['dic_neg_expansion']
+        self.loss_pos_thr = CED_cfg['loss_pos_IOU']
+        self.loss_neg_thr = CED_cfg['loss_neg_IOU']
+        self.ced_loss_weights = CED_cfg['loss_weights']
+        self.losses_warm_para = CED_cfg['losses_warm_para'],
+        self.loss_pos_num = CED_cfg['loss_pos_num']
+        self.loss_neg_num = CED_cfg['loss_neg_num']
+        self.dic_hard_num = int(CED_cfg['dic_samping_hard_rate'] * self.dic_sampling_num)
+        self.dic_common_num = self.dic_sampling_num - self.dic_hard_num
+        # change this stop
+
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+
+        self.anchor_generators = []
+        for anchor_base in self.anchor_base_sizes:
+            self.anchor_generators.append(AnchorGeneratorRotatedS2ANet(anchor_base, anchor_scales, anchor_ratios))
+
+        # anchor cache
+        self.base_anchors = dict()
+        self._init_layers()
+
+    def _init_layers(self):
+        self.relu = nn.ReLU()
+        self.fam_reg_convs = nn.ModuleList()
+        self.fam_cls_convs = nn.ModuleList()
+        for i in range(self.stacked_convs):
+            chn = self.in_channels if i == 0 else self.feat_channels
+            self.fam_reg_convs.append(
+                ConvModule(
+                    chn,
+                    self.feat_channels,
+                    3,
+                    stride=1,
+                    padding=1))
+            self.fam_cls_convs.append(
+                ConvModule(
+                    chn,
+                    self.feat_channels,
+                    3,
+                    stride=1,
+                    padding=1))
+
+        self.fam_reg = nn.Conv2d(self.feat_channels, 5, 1)
+        self.fam_cls = nn.Conv2d(self.feat_channels, self.cls_out_channels, 1)
+
+        self.align_conv = AlignConv(
+            self.feat_channels, self.feat_channels, kernel_size=3)
+
+        if self.with_orconv:
+            self.or_conv = ORConv2d(self.feat_channels, int(
+                self.feat_channels / 8), kernel_size=3, padding=1, arf_config=(1, 8))
+        else:
+            self.or_conv = nn.Conv2d(
+                self.feat_channels, self.feat_channels, 3, padding=1)
+
+        self.or_pool = RotationInvariantPooling(256, 8)
+
+        self.odm_reg_convs = nn.ModuleList()
+        self.odm_cls_convs = nn.ModuleList()
+        # change this start
+        self.odm_ced_conv1 = nn.Conv2d(self.feat_channels, self.feat_channels * 8, kernel_size=1)
+        self.odm_ced_conv2 = nn.Conv2d(self.feat_channels * 8, self.feat_channels, kernel_size=1)
+        self.odm_ced_bn1 = nn.BatchNorm(self.feat_channels * 8)
+        self.odm_ced_bn2 = nn.BatchNorm(self.feat_channels)
+        self.odm_ced_relu = nn.Relu()
+        # change this stop
+        for i in range(self.stacked_convs):
+            chn = int(self.feat_channels /
+                      8) if i == 0 and self.with_orconv else self.feat_channels
+            self.odm_reg_convs.append(
+                ConvModule(
+                    self.feat_channels,
+                    self.feat_channels,
+                    3,
+                    stride=1,
+                    padding=1))
+            self.odm_cls_convs.append(
+                ConvModule(
+                    chn,
+                    self.feat_channels,
+                    3,
+                    stride=1,
+                    padding=1))
+
+        self.odm_cls = nn.Conv2d(
+            self.feat_channels, self.cls_out_channels, 3, padding=1)
+        self.odm_reg = nn.Conv2d(self.feat_channels, 5, 3, padding=1)
+
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.fam_reg_convs:
+            normal_init(m.conv, std=0.01)
+        for m in self.fam_cls_convs:
+            normal_init(m.conv, std=0.01)
+        bias_cls = bias_init_with_prob(0.01)
+        normal_init(self.fam_reg, std=0.01)
+        normal_init(self.fam_cls, std=0.01, bias=bias_cls)
+
+        self.align_conv.init_weights()
+        # change this start
+        normal_init(self.odm_ced_conv1, std=0.01)
+        normal_init(self.odm_ced_conv2, std=0.01)
+        # change this stop
+        normal_init(self.or_conv, std=0.01)
+        for m in self.odm_reg_convs:
+            normal_init(m.conv, std=0.01)
+        for m in self.odm_cls_convs:
+            normal_init(m.conv, std=0.01)
+        normal_init(self.odm_cls, std=0.01, bias=bias_cls)
+        normal_init(self.odm_reg, std=0.01)
+
+    def forward_single(self, x, stride):
+        fam_reg_feat = x
+        for fam_reg_conv in self.fam_reg_convs:
+            fam_reg_feat = fam_reg_conv(fam_reg_feat)
+        fam_bbox_pred = self.fam_reg(fam_reg_feat)
+
+        # only forward during training
+        if self.is_training():
+            fam_cls_feat = x
+            for fam_cls_conv in self.fam_cls_convs:
+                fam_cls_feat = fam_cls_conv(fam_cls_feat)
+            fam_cls_score = self.fam_cls(fam_cls_feat)
+        else:
+            fam_cls_score = None
+
+        num_level = self.anchor_strides.index(stride)
+        featmap_size = tuple(fam_bbox_pred.shape[-2:])
+        if (num_level, featmap_size) in self.base_anchors:
+            init_anchors = self.base_anchors[(num_level, featmap_size)]
+        else:
+            init_anchors = self.anchor_generators[num_level].grid_anchors(featmap_size, self.anchor_strides[num_level])
+            self.base_anchors[(num_level, featmap_size)] = init_anchors
+
+        refine_anchor = bbox_decode(
+            fam_bbox_pred.detach(),
+            init_anchors,
+            self.target_means,
+            self.target_stds)
+
+        align_feat = self.align_conv(x, refine_anchor.clone(), stride)
+        or_feat = self.or_conv(align_feat)
+        # change this start
+        odm_ced_feat = or_feat
+        odm_ced_feat = self.odm_ced_conv1(odm_ced_feat)
+        odm_ced_feat = self.odm_ced_bn1(odm_ced_feat)
+        odm_ced_feat = self.odm_ced_relu(odm_ced_feat)
+        odm_ced_feat = self.odm_ced_conv2(odm_ced_feat)
+        odm_ced_feat = self.odm_ced_bn2(odm_ced_feat)
+        N, C, H, W = odm_ced_feat.shape
+        odm_ced_feat = odm_ced_feat.transpose(0,2,3,1).reshape(-1, odm_ced_feat.shape[1])
+        odm_ced_feat = odm_ced_feat / jt.norm(odm_ced_feat, keepdims=True)
+        odm_ced_feat = odm_ced_feat.reshape(N, H * W, C)
+        # odm_ced_feat = odm_ced_feat.transpose(0,3,1,2)
+        # change this stop
+
+        odm_reg_feat = or_feat
+        if self.with_orconv:
+            odm_cls_feat = self.or_pool(or_feat)
+        else:
+            odm_cls_feat = or_feat
+
+        for odm_reg_conv in self.odm_reg_convs:
+            odm_reg_feat = odm_reg_conv(odm_reg_feat)
+        for odm_cls_conv in self.odm_cls_convs:
+            odm_cls_feat = odm_cls_conv(odm_cls_feat)
+
+        odm_cls_score = self.odm_cls(odm_cls_feat)
+        odm_bbox_pred = self.odm_reg(odm_reg_feat)
+        # change this start
+        return fam_cls_score, fam_bbox_pred, refine_anchor, odm_cls_score, odm_bbox_pred, odm_ced_feat
+        # change this stop
+
+    def get_init_anchors(self,
+                         featmap_sizes,
+                         img_metas):
+        """Get anchors according to feature map sizes.
+
+        Args:
+            featmap_sizes (list[tuple]): Multi-level feature map sizes.
+            img_metas (list[dict]): Image meta info.
+
+        Returns:
+            tuple: anchors of each image, valid flags of each image
+        """
+        num_imgs = len(img_metas)
+        num_levels = len(featmap_sizes)
+
+        # since feature map sizes of all images are the same, we only compute
+        # anchors for one time
+        multi_level_anchors = []
+        for i in range(num_levels):
+            anchors = self.anchor_generators[i].grid_anchors(featmap_sizes[i], self.anchor_strides[i])
+            multi_level_anchors.append(anchors)
+        anchor_list = [multi_level_anchors for _ in range(num_imgs)]
+
+        # for each image, we compute valid flags of multi level anchors
+        valid_flag_list = []
+        for img_id, img_meta in enumerate(img_metas):
+            multi_level_flags = []
+            for i in range(num_levels):
+                anchor_stride = self.anchor_strides[i]
+                feat_h, feat_w = featmap_sizes[i]
+                w, h = img_meta['pad_shape'][:2]
+                valid_feat_h = min(int(np.ceil(h / anchor_stride)), feat_h)
+                valid_feat_w = min(int(np.ceil(w / anchor_stride)), feat_w)
+                flags = self.anchor_generators[i].valid_flags((feat_h, feat_w), (valid_feat_h, valid_feat_w))
+                multi_level_flags.append(flags)
+            valid_flag_list.append(multi_level_flags)
+        return anchor_list, valid_flag_list
+
+    def get_refine_anchors(self,
+                           featmap_sizes,
+                           refine_anchors,
+                           img_metas,
+                           is_train=True):
+        num_levels = len(featmap_sizes)
+
+        refine_anchors_list = []
+        for img_id, img_meta in enumerate(img_metas):
+            mlvl_refine_anchors = []
+            for i in range(num_levels):
+                refine_anchor = refine_anchors[i][img_id].reshape(-1, 5)
+                mlvl_refine_anchors.append(refine_anchor)
+            refine_anchors_list.append(mlvl_refine_anchors)
+
+        valid_flag_list = []
+        if is_train:
+            for img_id, img_meta in enumerate(img_metas):
+                multi_level_flags = []
+                for i in range(num_levels):
+                    anchor_stride = self.anchor_strides[i]
+                    feat_h, feat_w = featmap_sizes[i]
+                    w, h = img_meta['pad_shape'][:2]
+                    valid_feat_h = min(int(np.ceil(h / anchor_stride)), feat_h)
+                    valid_feat_w = min(int(np.ceil(w / anchor_stride)), feat_w)
+                    flags = self.anchor_generators[i].valid_flags((feat_h, feat_w), (valid_feat_h, valid_feat_w))
+                    multi_level_flags.append(flags)
+                valid_flag_list.append(multi_level_flags)
+        return refine_anchors_list, valid_flag_list
+
+        # change this start
+    def loss(self,
+             fam_cls_scores,
+             fam_bbox_preds,
+             refine_anchors,
+             odm_cls_scores,
+             odm_bbox_preds,
+             odm_ced_feat,
+             gt_bboxes,
+             gt_labels,
+             img_metas,
+             gt_bboxes_ignore=None):
+        # change this stop
+        cfg = self.train_cfg.copy()
+        featmap_sizes = [featmap.size()[-2:] for featmap in odm_cls_scores]
+        assert len(featmap_sizes) == len(self.anchor_generators)
+
+        anchor_list, valid_flag_list = self.get_init_anchors(featmap_sizes, img_metas)
+
+        # anchor number of multi levels
+        num_level_anchors = [anchors.size(0) for anchors in anchor_list[0]]
+        # concat all level anchors and flags to a single tensor
+        concat_anchor_list = []
+        for i in range(len(anchor_list)):
+            concat_anchor_list.append(jt.contrib.concat(anchor_list[i]))
+        all_anchor_list = images_to_levels(concat_anchor_list, num_level_anchors)
+
+        # Feature Alignment Module
+        label_channels = self.cls_out_channels if self.use_sigmoid_cls else 1
+        cls_reg_targets = anchor_target(
+            anchor_list,
+            valid_flag_list,
+            gt_bboxes,
+            img_metas,
+            self.target_means,
+            self.target_stds,
+            cfg.fam_cfg,
+            gt_bboxes_ignore_list=gt_bboxes_ignore,
+            gt_labels_list=gt_labels,
+            label_channels=label_channels,
+            sampling=self.sampling)
+        if cls_reg_targets is None:
+            return None
+        labels_list, label_weights_list, bbox_targets_list, bbox_weights_list, num_total_pos, num_total_neg = cls_reg_targets
+
+        num_total_samples = num_total_pos + num_total_neg if self.sampling else num_total_pos
+
+        losses_fam_cls, losses_fam_bbox = multi_apply(
+            self.loss_fam_single,
+            fam_cls_scores,
+            fam_bbox_preds,
+            all_anchor_list,
+            labels_list,
+            label_weights_list,
+            bbox_targets_list,
+            bbox_weights_list,
+            num_total_samples=num_total_samples,
+            cfg=cfg.fam_cfg)
+
+        # Oriented Detection Module targets
+        refine_anchors_list, valid_flag_list = self.get_refine_anchors(
+            featmap_sizes, refine_anchors, img_metas)
+
+        # anchor number of multi levels
+        num_level_anchors = [anchors.size(0)
+                             for anchors in refine_anchors_list[0]]
+        # concat all level anchors and flags to a single tensor
+        concat_anchor_list = []
+        for i in range(len(refine_anchors_list)):
+            concat_anchor_list.append(jt.contrib.concat(refine_anchors_list[i]))
+        all_anchor_list = images_to_levels(concat_anchor_list,
+                                           num_level_anchors)
+
+        label_channels = self.cls_out_channels if self.use_sigmoid_cls else 1
+        cls_reg_targets = anchor_target(
+            refine_anchors_list,
+            valid_flag_list,
+            gt_bboxes,
+            img_metas,
+            self.target_means,
+            self.target_stds,
+            cfg.odm_cfg,
+            gt_bboxes_ignore_list=gt_bboxes_ignore,
+            gt_labels_list=gt_labels,
+            label_channels=label_channels,
+            sampling=self.sampling)
+        if cls_reg_targets is None:
+            return None
+        (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
+         num_total_pos, num_total_neg) = cls_reg_targets
+
+        num_total_samples = (
+            num_total_pos + num_total_neg if self.sampling else num_total_pos)
+
+        losses_odm_cls, losses_odm_bbox = multi_apply(
+            self.loss_odm_single,
+            odm_cls_scores,
+            odm_bbox_preds,
+            all_anchor_list,
+            labels_list,
+            label_weights_list,
+            bbox_targets_list,
+            bbox_weights_list,
+            num_total_samples=num_total_samples,
+            cfg=cfg.odm_cfg)
+
+        # change this
+        if self.ced_mode == "all":
+            cal_ced_loss_ids, cal_ced_loss_relative_ids, res_gt_ids = self.cal_CEL_all(odm_bbox_preds, img_metas, refine_anchors, odm_ced_feat, odm_cls_scores, gt_bboxes, gt_labels)
+        else:
+            assert self.ced_mode == "all"
+        # 5.损失函数的计算  return [jt.var[mean]]    self.CED_dict
+        losses_odm_ceds = []
+        losses_odm_ced = 0.
+        losses_ced_warm_para = self.losses_warm_para
+        ### 将i的数值 对应到对应的odm_ced_feat位置 [layers][batch][W][H][C]
+        select_tap = False
+        if len(cal_ced_loss_ids) != 0:
+            temp_len = 0.
+            for i in range(len(cal_ced_loss_relative_ids)):
+                cls_id = res_gt_ids[cal_ced_loss_relative_ids[i]][0]
+                t_i = cal_ced_loss_ids[i]
+                for select_i in range(len(odm_ced_feat)):
+                    sel_i = select_i
+                    for select_j in range(len(odm_ced_feat[select_i])):
+                        sel_j = select_j
+                        if t_i < odm_ced_feat[select_i][select_j].shape[0]:
+                            select_tap = True
+                            sel_z = t_i
+                            break
+                        else:
+                            t_i = t_i - odm_ced_feat[select_i][select_j].shape[0]
+                    if select_tap:
+                        break
+                # 余弦相似度计算公式 np.dot(np.array(a), np.array(b).T) / (np.linalg.norm(np.array(a)) * np.linalg.norm(np.array(b)))
+                # 计算除数
+                temp_dividend = []
+                temp_divisor = []
+                for j in range(self.num_classes):
+                    if len(self.CED_dict[str(j)]) == 0:
+                        continue
+                    if j == cls_id:
+                        temp = jt.multiply(odm_ced_feat[sel_i][sel_j][sel_z], jt.stack(self.CED_dict[str(j)], dim=0)).sum(dim=1)
+                        temp_dividend.extend(temp)
+                        temp_divisor.extend(temp)
+                    else:
+                        temp = jt.multiply(odm_ced_feat[sel_i][sel_j][sel_z], jt.stack(self.CED_dict[str(j)], dim=0)).sum(dim=1)
+                        temp_divisor.extend(temp)
+                # mask过滤 start
+                temp_dividend = jt.stack(temp_dividend, dim=0)
+                temp_dividend = jt.squeeze(temp_dividend, dim=1)
+                temp_dividend = temp_dividend[(temp_dividend <= 0.999).nonzero()]
+                temp_dividend = jt.squeeze(temp_dividend, dim=1)
+                temp_divisor = jt.stack(temp_divisor, dim=0)
+                temp_divisor = jt.squeeze(temp_divisor, dim=1)
+                temp_divisor = temp_divisor[(temp_divisor <= 0.999).nonzero()]
+                temp_divisor = jt.squeeze(temp_divisor, dim=1)
+                # mask过滤 stop
+                temp_dividend = jt.exp(temp_dividend / losses_ced_warm_para[0])
+                temp_len += temp_dividend.shape[0]
+                temp_divisor = jt.exp(temp_divisor / losses_ced_warm_para[0]).sum()
+                losses_odm_ced += -jt.log(temp_dividend / temp_divisor).sum()
+            if temp_len == 0:
+                losses_odm_ceds.append(jt.Var(0.0))
+            losses_odm_ced /= temp_len
+            losses_odm_ced *= self.ced_loss_weights
+            losses_odm_ceds.append(losses_odm_ced)
+        else:
+            assert len(cal_ced_loss_ids) != 0
+        # print(len(cal_ced_loss_ids), len(cal_ced_loss_relative_ids), len(res_gt_ids))
+        # for i in self.CED_dict:
+        #     print(f"{i}:{len(self.CED_dict[i])}")
+        return dict(loss_fam_cls=losses_fam_cls,
+                    loss_fam_bbox=losses_fam_bbox,
+                    loss_odm_cls=losses_odm_cls,
+                    loss_odm_bbox=losses_odm_bbox,
+                    loss_odm_ced=losses_odm_ceds)
+
+    def cal_CEL_all(self, odm_bbox_preds, img_metas, refine_anchors, odm_ced_feat, odm_cls_scores, gt_bboxes, gt_labels):
+        # change this start
+        # 1. 提取batch内所有图片特征序列的信息，并计算其与GT-box的IOU
+        # num_feature num_batch channel H W
+        res_gt_ids = res_ious = res_topk_ids = res_topk_scores = res_features = res_locate_ids = None
+        # temp_i特征层 temp_pic图片id temp_j预测框id temp_k标签框id
+        last_layers_num = 0
+        for temp_i in range(len(odm_bbox_preds)):
+            for temp_pic in range(len(odm_bbox_preds[temp_i])):
+                img_shape = img_metas[temp_pic]['img_shape']
+                # 每张图对应对应一个特征层的bbox C H W
+                temp_bbox = np.array(odm_bbox_preds[temp_i][temp_pic])
+                # C W H --> W H C --> num C
+                temp_bbox = temp_bbox.transpose(1, 2, 0).reshape(-1, 5)
+                # 每张图对应一个特征层的anchor W H C --> num C
+                temp_refine_bbox = np.array(refine_anchors[temp_i][temp_pic])
+                temp_refine_bbox = temp_refine_bbox.reshape(-1, 5)
+                # 随机获取样本 不足则全取
+                """
+                temp_sampling_ids = np.array(list(range(len(new_temp_bbox))))
+                if len(temp_sampling_ids) > self.random_sampling_num:
+                    np.random.shuffle(temp_sampling_ids)
+                    temp_sampling_ids = temp_sampling_ids[:self.random_sampling_num]
+                """
+                # 对每张图对应一个特征层的pre映射到原图
+                new_temp_bbox = self.delta2bbox_rotated_CED(temp_refine_bbox, temp_bbox, means=(0., 0., 0., 0., 0.),
+                                                            stds=(1., 1., 1., 1., 1.), max_shape=img_shape)
+                # 获取pre所对应的features 待调整
+                temp_features = odm_ced_feat[temp_i][temp_pic]
+                # 获取pre对应的cls_score
+                temp_scores = np.array(odm_cls_scores[temp_i][temp_pic].sigmoid())
+                temp_scores = temp_scores.transpose(1, 2, 0).reshape(-1, temp_scores.shape[0])
+                # 随机获取样本 不足则全取
+                temp_sampling_ids = np.array(list(range(len(new_temp_bbox))))
+                if len(temp_sampling_ids) > self.random_sampling_num:
+                    np.random.shuffle(temp_sampling_ids)
+                    temp_sampling_ids = temp_sampling_ids[:self.random_sampling_num]
+                for temp_j in temp_sampling_ids:
+                    temp_max_iou = 0.0
+                    temp_gt_id = 0
+                    temp_pre = new_temp_bbox[temp_j]
+                    temp_score = temp_scores[temp_j]
+                    temp_feature = temp_features[temp_j].data
+                    # 抽取topk cls 和 score 如果类别数量少于3则全取，否则取top-3
+                    if len(temp_score) >= 3:
+                        temp_sorted = sorted(temp_score, reverse=True)[0:3]
+                        indexes = [list(temp_score).index(i) for i in temp_sorted]
+                        temp_topk_id = np.array(indexes) + 1
+                        temp_topk_score = temp_score[indexes]
+                    else:
+                        temp_sorted = sorted(temp_score, reverse=True)
+                        indexes = [list(temp_score).index(i) for i in temp_sorted]
+                        temp_topk_id = np.array(indexes) + 1
+                        temp_topk_score = temp_score[indexes]
+                    for temp_k in range(len(gt_bboxes[temp_pic])):
+                        # 计算IOU,确定gt_label   计算每个pre 与 label的IOU，通过最大的确定gt_label及IOU，并保存至temp_ced_pre
+                        temp_gt = np.array(gt_bboxes[temp_pic])[temp_k]
+                        temp_iou = self.cal_rotate_iou_single(temp_gt, temp_pre)
+                        if temp_iou > temp_max_iou:
+                            temp_max_iou = temp_iou
+                            temp_gt_id = np.array(gt_labels[temp_pic][temp_k])[0]
+                    # 将 IOU<neg_thr 的GT修改为背景
+                    if temp_max_iou < self.loss_neg_thr:
+                        temp_gt_id = 0
+                    if res_gt_ids is None:
+                        res_gt_ids = np.array([[temp_gt_id]])
+                        res_ious = np.array([[temp_max_iou]])
+                        res_topk_ids = np.array([temp_topk_id])
+                        res_topk_scores = np.array([temp_topk_score])
+                        res_locate_ids = np.array([last_layers_num + temp_j])
+                        res_features = jt.unsqueeze(temp_feature, dim=0)
+                    else:
+                        res_gt_ids = np.append(res_gt_ids, [[temp_gt_id]], axis=0)
+                        res_ious = np.append(res_ious, [[temp_max_iou]], axis=0)
+                        res_topk_ids = np.append(res_topk_ids, [list(temp_topk_id)], axis=0)
+                        res_topk_scores = np.append(res_topk_scores, [list(temp_topk_score)], axis=0)
+                        res_locate_ids = np.append(res_locate_ids,[last_layers_num + temp_j],axis=0)
+                        res_features = jt.concat((res_features, jt.unsqueeze(temp_feature, dim=0)), dim=0)
+                last_layers_num += temp_features.shape[0]
+        # 2.根据IOU对图片进行前景/背景的划分，获取前景/背景的序号   以及用于计算损失的样本的序号
+        # res_gt_ids = res_ious = res_topk_ids = res_topk_scores = res_features
+        dic_pos_ids = []
+        dic_neg_ids = []
+        cal_ced_loss_ids = []
+        cal_ced_loss_relative_ids = []
+        cal_ced_loss_ids_neg = []
+        cal_ced_loss_relative_ids_neg = []
+        # 待调整 考虑对负样本进行对比损失计算
+        temp_ids = list(np.array(list(range(res_ious.shape[0]))))
+        for temp_i in temp_ids:
+            if res_ious[temp_i][0] >= self.dic_pos_thr:
+                dic_pos_ids.append(temp_i)
+            elif res_ious[temp_i][0] < self.dic_neg_thr:
+                dic_neg_ids.append(temp_i)
+            if res_ious[temp_i][0] >= self.loss_pos_thr:
+                cal_ced_loss_ids.append(res_locate_ids[temp_i])
+                cal_ced_loss_relative_ids.append([temp_i])
+            if res_ious[temp_i][0] < self.loss_neg_thr:
+                cal_ced_loss_ids_neg.append(res_locate_ids[temp_i])
+                cal_ced_loss_relative_ids_neg.append([temp_i])
+        # 如果没有采集到计算损失的正样本，则从负样本补充 采集anchor
+        if len(cal_ced_loss_ids) < self.loss_pos_num:
+            get_num = self.loss_pos_num + self.loss_neg_num - len(cal_ced_loss_ids)
+            cal_ced_loss_ids.extend(cal_ced_loss_ids_neg[:get_num])
+            cal_ced_loss_relative_ids = cal_ced_loss_relative_ids + cal_ced_loss_relative_ids_neg[:get_num]
+        elif len(cal_ced_loss_ids) >= self.loss_pos_num:
+            get_num = self.loss_neg_num
+            cal_ced_loss_ids = cal_ced_loss_ids[:self.loss_pos_num]
+            cal_ced_loss_relative_ids = cal_ced_loss_relative_ids[:self.loss_pos_num]
+            cal_ced_loss_ids.extend(cal_ced_loss_ids_neg[:get_num])
+            cal_ced_loss_relative_ids = cal_ced_loss_relative_ids + cal_ced_loss_relative_ids_neg[:get_num]
+
+        # 3.进行前景/背景的难样本排序，并根据每个类别提取topk个难样本的id，其中背景为neg_expansion*topk个
+        # res_gt_ids = res_ious = res_topk_ids = res_topk_scores = res_features
+        temp_dict = {}
+        insert_dict = {}
+        for i in range(self.num_classes):
+            temp_dict[str(i)] = {}
+            insert_dict[str(i)] = []
+        for i in range(len(dic_pos_ids)):
+            temp_id = dic_pos_ids[i]
+            if res_topk_ids[temp_id][0] != res_gt_ids[temp_id][0]:
+                temp1 = 1 - res_ious[temp_id]
+                temp2 = res_gt_ids[temp_id][0]
+                temp3 = temp_id
+                temp_dict[str(temp2)][str(temp3)] = temp1[0]
+            else:
+                if len(res_topk_scores[temp_id]) == 3:
+                    temp1 = [1 - (2 * res_topk_scores[temp_id][0] - res_topk_scores[temp_id][1] - res_topk_scores[temp_id][2]) / 2] * (1 - res_ious[temp_id])
+                    temp2 = res_gt_ids[temp_id][0]
+                    temp3 = temp_id
+                    temp_dict[str(temp2)][str(temp3)] = temp1[0]
+                elif len(res_topk_scores[temp_id]) == 2:
+                    temp1 = [1 - res_topk_scores[temp_id][0] + res_topk_scores[temp_id][1]] * (1 - res_ious[temp_id])
+                    temp2 = res_gt_ids[temp_id][0]
+                    temp3 = temp_id
+                    temp_dict[str(temp2)][str(temp3)] = temp1[0]
+                elif len(res_topk_scores[temp_id]) == 1:
+                    assert len(res_topk_scores) != 1, "len(res_topk_scores) should not equal 1"
+
+        for i in range(len(dic_neg_ids)):
+            temp_id = dic_neg_ids[i]
+            temp1 = (1 - res_ious[temp_id]) * (1 - res_topk_scores[temp_id][0])
+            temp2 = 0
+            temp3 = temp_id
+            temp_dict[str(temp2)][str(temp3)] = temp1[0]
+
+        for i in range(self.num_classes):
+            if i == 0:
+                sampling_num = self.dic_sampling_num * self.dic_neg_expansion
+                hard_num = self.dic_hard_num * self.dic_neg_expansion
+                common_num = self.dic_common_num * self.dic_neg_expansion
+            else:
+                sampling_num = self.dic_sampling_num
+                hard_num = self.dic_hard_num
+                common_num = self.dic_common_num
+            # temp = sorted(temp_dict[str(i)].items(), reverse=True, key=operator.itemgetter(1))[:sampling_num]
+            temp = sorted(temp_dict[str(i)].items(), reverse=True, key=operator.itemgetter(1))
+            if len(temp) > sampling_num:
+                temp1 = temp[:hard_num]
+                temp2 = temp[hard_num:]
+                random.shuffle(temp2)
+                temp = temp1 + temp2[:common_num]
+            for j in range(len(temp)):
+                temp_p = int(temp[j][0])
+                insert_dict[str(i)].append(temp_p)
+
+        # 4.存入字典 —— 根据保存的难样本id，将特征序列存入对应的位置  self.CED_dict
+        for i in range(self.num_classes):
+            if len(insert_dict[str(i)]) == 0:
+                continue
+            else:
+                if i == 0:
+                    dic_max_len = self.dic_max_len * self.dic_neg_expansion
+                else:
+                    dic_max_len = self.dic_max_len
+                for j in insert_dict[str(i)]:
+                    if len(self.CED_dict[str(i)]) >= dic_max_len:
+                        self.CED_dict[str(i)].pop(0)
+                        temp = res_features[j]
+                        self.CED_dict[str(i)].append(temp)
+                    else:
+                        temp = res_features[j]
+                        self.CED_dict[str(i)].append(temp)
+        return cal_ced_loss_ids, cal_ced_loss_relative_ids, res_gt_ids
+
+    # new code
+    def cal_rotate_iou_single(self, bbox1, bbox2):
+        area1 = bbox1[2] * bbox1[3]
+        area2 = bbox2[2] * bbox2[3]
+        r1 = ((bbox1[0], bbox1[1]), (bbox1[2], bbox1[3]), bbox1[4])
+        r2 = ((bbox2[0], bbox2[1]), (bbox2[2], bbox2[3]), bbox2[4])
+        int_pts = cv2.rotatedRectangleIntersection(r1, r2)[1]
+        if int_pts is not None:
+            order_pts = cv2.convexHull(int_pts, returnPoints=True)
+            int_area = cv2.contourArea(order_pts)
+            inter = int_area * 1.0 / (area1 + area2 - int_area)
+            return float(inter)
+        else:
+            return 0.0
+
+    # new code
+    def delta2bbox_rotated_CED(self, rois, deltas, means=(0., 0., 0., 0., 0.), stds=(1., 1., 1., 1., 1.), max_shape=None, wh_ratio_clip=16 / 1000, clip_border=True):
+        # return np_tensor
+        means = np.array(means)
+        stds = np.array(stds)
+        max_height = np.array(max_shape)[0]
+        max_width = np.array(max_shape)[1]
+        denorm_deltas = deltas * stds + means
+
+        dx = denorm_deltas[:, 0::5]
+        dy = denorm_deltas[:, 1::5]
+        dw = denorm_deltas[:, 2::5]
+        dh = denorm_deltas[:, 3::5]
+        dangle = denorm_deltas[:, 4::5]
+
+        max_ratio = np.abs(np.log(wh_ratio_clip))
+
+        dw = np.clip(dw, -max_ratio, max_ratio)
+        dh = np.clip(dh, -max_ratio, max_ratio)
+
+        roi_x = rois[:, 0::5]
+        roi_y = rois[:, 1::5]
+        roi_w = rois[:, 2::5]
+        roi_h = rois[:, 3::5]
+        roi_angle = rois[:, 4::5]
+        ncos = np.cos(roi_angle)
+        nsin = np.sin(roi_angle)
+
+        gx = (dx * roi_w * ncos) - (dy * roi_h * nsin) + roi_x
+        gy = (dx * roi_w * nsin) + (dy * roi_h * ncos) + roi_y
+        gw = roi_w * np.exp(dw)
+        gh = roi_h * np.exp(dh)
+
+        ga = np.pi * dangle + roi_angle
+        ga = self.norm_angle(ga)
+
+        bboxes = np.stack((gx, gy, gw, gh, ga), axis=-1)
+
+        bboxes = bboxes.reshape(-1, 5)
+        return bboxes
+
+    # new code
+    def norm_angle(self, angle, range=[float(-np.pi / 4), float(np.pi)]):
+        ret = (angle - range[0]) % range[1] + range[0]
+        return ret
+
+    def loss_fam_single(self,
+                        fam_cls_score,
+                        fam_bbox_pred,
+                        anchors,
+                        labels,
+                        label_weights,
+                        bbox_targets,
+                        bbox_weights,
+                        num_total_samples,
+                        cfg):
+        # classification loss
+        labels = labels.reshape(-1)
+        label_weights = label_weights.reshape(-1)
+        fam_cls_score = fam_cls_score.permute(
+            0, 2, 3, 1).reshape(-1, self.cls_out_channels)
+        loss_fam_cls = self.loss_fam_cls(
+            fam_cls_score, labels, label_weights, avg_factor=num_total_samples)
+        # regression loss
+        bbox_targets = bbox_targets.reshape(-1, 5)
+        bbox_weights = bbox_weights.reshape(-1, 5)
+        fam_bbox_pred = fam_bbox_pred.permute(0, 2, 3, 1).reshape(-1, 5)
+
+        reg_decoded_bbox = cfg.get('reg_decoded_bbox', False)
+        if reg_decoded_bbox:
+            # When the regression loss (e.g. `IouLoss`, `GIouLoss`)
+            # is applied directly on the decoded bounding boxes, it
+            # decodes the already encoded coordinates to absolute format.
+            bbox_coder_cfg = cfg.get('bbox_coder', '')
+            if bbox_coder_cfg == '':
+                bbox_coder_cfg = dict(type='DeltaXYWHBBoxCoder')
+            bbox_coder = build_from_cfg(bbox_coder_cfg, BOXES)
+            anchors = anchors.reshape(-1, 5)
+            fam_bbox_pred = bbox_coder.decode(anchors, fam_bbox_pred)
+        loss_fam_bbox = self.loss_fam_bbox(
+            fam_bbox_pred,
+            bbox_targets,
+            bbox_weights,
+            avg_factor=num_total_samples)
+        return loss_fam_cls, loss_fam_bbox
+
+    def loss_odm_single(self,
+                        odm_cls_score,
+                        odm_bbox_pred,
+                        anchors,
+                        labels,
+                        label_weights,
+                        bbox_targets,
+                        bbox_weights,
+                        num_total_samples,
+                        cfg):
+        # classification loss
+        labels = labels.reshape(-1)
+        label_weights = label_weights.reshape(-1)
+        odm_cls_score = odm_cls_score.permute(0, 2, 3,
+                                              1).reshape(-1, self.cls_out_channels)
+        loss_odm_cls = self.loss_odm_cls(
+            odm_cls_score, labels, label_weights, avg_factor=num_total_samples)
+        # regression loss
+        bbox_targets = bbox_targets.reshape(-1, 5)
+        bbox_weights = bbox_weights.reshape(-1, 5)
+        odm_bbox_pred = odm_bbox_pred.permute(0, 2, 3, 1).reshape(-1, 5)
+
+        reg_decoded_bbox = cfg.get('reg_decoded_bbox', False)
+        if reg_decoded_bbox:
+            # When the regression loss (e.g. `IouLoss`, `GIouLoss`)
+            # is applied directly on the decoded bounding boxes, it
+            # decodes the already encoded coordinates to absolute format.
+            bbox_coder_cfg = cfg.get('bbox_coder', '')
+            if bbox_coder_cfg == '':
+                bbox_coder_cfg = dict(type='DeltaXYWHBBoxCoder')
+            bbox_coder = build_from_cfg(bbox_coder_cfg, BOXES)
+            anchors = anchors.reshape(-1, 5)
+            odm_bbox_pred = bbox_coder.decode(anchors, odm_bbox_pred)
+        loss_odm_bbox = self.loss_odm_bbox(
+            odm_bbox_pred,
+            bbox_targets,
+            bbox_weights,
+            avg_factor=num_total_samples)
+        return loss_odm_cls, loss_odm_bbox
+
+    def get_bboxes(self,
+                   fam_cls_scores,
+                   fam_bbox_preds,
+                   refine_anchors,
+                   odm_cls_scores,
+                   odm_bbox_preds,
+                   img_metas,
+                   rescale=True):
+        assert len(odm_cls_scores) == len(odm_bbox_preds)
+        cfg = self.test_cfg.copy()
+
+        featmap_sizes = [featmap.size()[-2:] for featmap in odm_cls_scores]
+        num_levels = len(odm_cls_scores)
+
+        refine_anchors = self.get_refine_anchors(
+            featmap_sizes, refine_anchors, img_metas, is_train=False)
+        result_list = []
+        for img_id in range(len(img_metas)):
+            cls_score_list = [
+                odm_cls_scores[i][img_id].detach() for i in range(num_levels)
+            ]
+            bbox_pred_list = [
+                odm_bbox_preds[i][img_id].detach() for i in range(num_levels)
+            ]
+            img_shape = img_metas[img_id]['img_shape']
+            scale_factor = img_metas[img_id]['scale_factor']
+            proposals = self.get_bboxes_single(cls_score_list, bbox_pred_list,
+                                               refine_anchors[0][img_id], img_shape,
+                                               scale_factor, cfg, rescale)
+
+            result_list.append(proposals)
+        return result_list
+
+    def get_bboxes_single(self,
+                          cls_score_list,
+                          bbox_pred_list,
+                          mlvl_anchors,
+                          img_shape,
+                          scale_factor,
+                          cfg,
+                          rescale=False):
+        """
+        Transform outputs for a single batch item into labeled boxes.
+        """
+
+        assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_anchors)
+        mlvl_bboxes = []
+        mlvl_scores = []
+        for cls_score, bbox_pred, anchors in zip(cls_score_list,
+                                                 bbox_pred_list, mlvl_anchors):
+            assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
+            cls_score = cls_score.permute(
+                1, 2, 0).reshape(-1, self.cls_out_channels)
+
+            if self.use_sigmoid_cls:
+                scores = cls_score.sigmoid()
+            else:
+                scores = cls_score.softmax(-1)
+
+            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 5)
+            # anchors = rect2rbox(anchors)
+            nms_pre = cfg.get('nms_pre', -1)
+            if nms_pre > 0 and scores.shape[0] > nms_pre:
+                # Get maximum scores for foreground classes.
+                if self.use_sigmoid_cls:
+                    max_scores = scores.max(dim=1)
+                else:
+                    max_scores = scores[:, 1:].max(dim=1)
+                _, topk_inds = max_scores.topk(nms_pre)
+                anchors = anchors[topk_inds, :]
+                bbox_pred = bbox_pred[topk_inds, :]
+                scores = scores[topk_inds, :]
+            bboxes = delta2bbox_rotated(anchors, bbox_pred, self.target_means,
+                                        self.target_stds, img_shape)
+            mlvl_bboxes.append(bboxes)
+            mlvl_scores.append(scores)
+        mlvl_bboxes = jt.contrib.concat(mlvl_bboxes)
+        if rescale:
+            mlvl_bboxes[..., :4] /= scale_factor
+        mlvl_scores = jt.contrib.concat(mlvl_scores)
+        if self.use_sigmoid_cls:
+            # Add a dummy background class to the front when using sigmoid
+            padding = jt.zeros((mlvl_scores.shape[0], 1), dtype=mlvl_scores.dtype)
+            mlvl_scores = jt.contrib.concat([padding, mlvl_scores], dim=1)
+        det_bboxes, det_labels = multiclass_nms_rotated(mlvl_bboxes,
+                                                        mlvl_scores,
+                                                        cfg.score_thr, cfg.nms,
+                                                        cfg.max_per_img)
+        boxes = det_bboxes[:, :5]
+        scores = det_bboxes[:, 5]
+        polys = rotated_box_to_poly(boxes)
+        return polys, scores, det_labels
+
+    def parse_targets(self, targets, is_train=True):
+        img_metas = []
+        gt_bboxes = []
+        gt_bboxes_ignore = []
+        gt_labels = []
+
+        for target in targets:
+            if is_train:
+                gt_bboxes.append(target["rboxes"])
+                gt_labels.append(target["labels"])
+                gt_bboxes_ignore.append(target["rboxes_ignore"])
+            img_metas.append(dict(
+                img_shape=target["img_size"][::-1],
+                scale_factor=target["scale_factor"],
+                pad_shape=target["pad_shape"]
+            ))
+        if not is_train:
+            return img_metas
+        return gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore
+
+    def execute(self, feats, targets):
+        outs = multi_apply(self.forward_single, feats, self.anchor_strides)
+        if self.is_training():
+            return self.loss(*outs, *self.parse_targets(targets))
+        else:
+            """
+            # change this
+            from sklearn.manifold import TSNE
+            temp_preds = outs[-2]
+            temp_features = outs[-1]
+
+            for i in range(len(temp_features)):
+                for j in range(len(temp_features[i])):
+                    tsne = TSNE(n_components=2, random_state=1)
+                    tsne = tsne.fit_transform(np.array(temp_features[i][j])[:200])
+                    if len(x) == 0:
+                        x = tsne
+                    else:
+                        x = np.concatenate((x,tsne), axis=0)
+    
+            a = np.ones(len(x))
+            plt.scatter(x[:, 0], x[:, 1], c=a)
+            plt.legend()
+            plt.savefig("/home/msi/桌面/10086/1.png", dpi=1000)
+            # change stop
+            """
+            return self.get_bboxes(*outs[:-1], self.parse_targets(targets, is_train=False))
+
+
+def bbox_decode(
+        bbox_preds,
+        anchors,
+        means=[0, 0, 0, 0, 0],
+        stds=[1, 1, 1, 1, 1]):
+    """
+    Decode bboxes from deltas
+    :param bbox_preds: [N,5,H,W]
+    :param anchors: [H*W,5]
+    :param means: mean value to decode bbox
+    :param stds: std value to decode bbox
+    :return: [N,H,W,5]
+    """
+    num_imgs, _, H, W = bbox_preds.shape
+    bboxes_list = []
+    for img_id in range(num_imgs):
+        bbox_pred = bbox_preds[img_id]
+        # bbox_pred.shape=[5,H,W]
+        bbox_delta = bbox_pred.permute(1, 2, 0).reshape(-1, 5)
+        bboxes = delta2bbox_rotated(
+            anchors, bbox_delta, means, stds, wh_ratio_clip=1e-6)
+        bboxes = bboxes.reshape(H, W, 5)
+        bboxes_list.append(bboxes)
+    return jt.stack(bboxes_list, dim=0)
+
+
+class AlignConv(nn.Module):
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=3,
+                 deformable_groups=1):
+        super(AlignConv, self).__init__()
+        self.kernel_size = kernel_size
+        self.deform_conv = DeformConv(in_channels,
+                                      out_channels,
+                                      kernel_size=kernel_size,
+                                      padding=(kernel_size - 1) // 2,
+                                      deformable_groups=deformable_groups)
+        self.relu = nn.ReLU()
+
+    def init_weights(self):
+        normal_init(self.deform_conv, std=0.01)
+
+    @jt.no_grad()
+    def get_offset(self, anchors, featmap_size, stride):
+        dtype = anchors.dtype
+        feat_h, feat_w = featmap_size
+        pad = (self.kernel_size - 1) // 2
+        idx = jt.arange(-pad, pad + 1, dtype=dtype)
+        yy, xx = jt.meshgrid(idx, idx)
+        xx = xx.reshape(-1)
+        yy = yy.reshape(-1)
+
+        # get sampling locations of default conv
+        xc = jt.arange(0, feat_w, dtype=dtype)
+        yc = jt.arange(0, feat_h, dtype=dtype)
+        yc, xc = jt.meshgrid(yc, xc)
+        xc = xc.reshape(-1)
+        yc = yc.reshape(-1)
+        x_conv = xc[:, None] + xx
+        y_conv = yc[:, None] + yy
+
+        # get sampling locations of anchors
+        x_ctr, y_ctr, w, h, a = jt.unbind(anchors, dim=1)
+        x_ctr, y_ctr, w, h = x_ctr / stride, y_ctr / stride, w / stride, h / stride
+        cos, sin = jt.cos(a), jt.sin(a)
+        dw, dh = w / self.kernel_size, h / self.kernel_size
+        x, y = dw[:, None] * xx, dh[:, None] * yy
+        xr = cos[:, None] * x - sin[:, None] * y
+        yr = sin[:, None] * x + cos[:, None] * y
+        x_anchor, y_anchor = xr + x_ctr[:, None], yr + y_ctr[:, None]
+        # get offset filed
+        offset_x = x_anchor - x_conv
+        offset_y = y_anchor - y_conv
+        # x, y in anchors is opposite in image coordinates,
+        # so we stack them with y, x other than x, y
+        offset = jt.stack([offset_y, offset_x], dim=-1)
+        # NA,ks*ks*2
+        offset = offset.reshape(anchors.size(
+            0), -1).permute(1, 0).reshape(-1, feat_h, feat_w)
+        return offset
+
+    def execute(self, x, anchors, stride):
+        num_imgs, H, W = anchors.shape[:3]
+        offset_list = [
+            self.get_offset(anchors[i].reshape(-1, 5), (H, W), stride)
+            for i in range(num_imgs)
+        ]
+        offset_tensor = jt.stack(offset_list, dim=0)
+        x = self.relu(self.deform_conv(x, offset_tensor))
+        return x
