@@ -1,4 +1,0 @@
-_base_: '5_base.yaml'
-b:
-  a: 5
-  c: 6
