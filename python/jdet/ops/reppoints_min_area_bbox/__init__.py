@@ -1,1 +1,0 @@
-from .min_area_bbox import reppoints_min_area_bbox
